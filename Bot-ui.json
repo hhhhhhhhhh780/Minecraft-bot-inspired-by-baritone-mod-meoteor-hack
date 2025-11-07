@@ -1,0 +1,392 @@
+#!/usr/bin/env node
+/**
+ * bot-ui.js (single-instance lock)
+ * - Ensures only one bot runs at a time using a lock file ~/mc-bot-ui/bot.lock
+ * - If a running PID exists, prompts to force-kill it before starting new bot
+ * - Cleanly removes lock on normal stop or on process exit
+ *
+ * NOTE: still requires mineflayer packages if you choose to actually connect.
+ */
+
+import inquirer from "inquirer";
+import chalk from "chalk";
+import ora from "ora";
+import fs from "fs";
+import path from "path";
+import process from "process";
+
+const HOME = process.env.HOME || "/data/data/com.termux/files/home";
+const LOCK_FILE = path.join(HOME, "mc-bot-ui", "bot.lock");
+
+let state = {
+  ip: "127.0.0.1",
+  port: 25565,
+  version: "1.20.1",
+  name: "BotTermux",
+  features: [],
+  running: false,
+  bot: null,
+  spinner: null
+};
+
+const featuresChoices = [
+  { name: "Auto Totem (heuristic)", value: "auto_totem" },
+  { name: "Auto Mine", value: "auto_mine" },
+  { name: "Auto PvP", value: "auto_pvp" },
+  { name: "Auto Eat", value: "auto_eat" },
+  { name: "Auto Walk", value: "auto_walk" }
+];
+
+function drawHeader() {
+  console.log(chalk.green("=============================="));
+  console.log(chalk.bold.cyan("🤖  BOT MINECRAFT TERMUX"));
+  console.log(chalk.green("=============================="));
+}
+
+function drawStatus() {
+  console.log(`${chalk.yellow("Tên bot:")} ${state.name}`);
+  console.log(`${chalk.yellow("Server:")} ${state.ip}:${state.port}`);
+  console.log(`${chalk.yellow("Phiên bản:")} ${state.version}`);
+  console.log(`${chalk.yellow("Chế độ:")} ${state.features.length ? state.features.join(", ") : "None"}`);
+  console.log(`${chalk.yellow("Trạng thái:")} ${state.running ? chalk.green("🟢 Đang chạy") : chalk.red("🔴 Đã dừng")}`);
+  console.log("");
+}
+
+/* ---------------- Lock file helpers ---------------- */
+
+function lockExists() {
+  try {
+    return fs.existsSync(LOCK_FILE);
+  } catch (e) {
+    return false;
+  }
+}
+
+function readLockPid() {
+  try {
+    const txt = fs.readFileSync(LOCK_FILE, "utf8").trim();
+    const pid = Number(txt);
+    return Number.isFinite(pid) ? pid : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function writeLockPid(pid) {
+  try {
+    fs.mkdirSync(path.dirname(LOCK_FILE), { recursive: true });
+    fs.writeFileSync(LOCK_FILE, String(pid), { encoding: "utf8" });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function removeLockFile() {
+  try {
+    if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE);
+  } catch (e) {}
+}
+
+function isPidRunning(pid) {
+  if (!pid || pid <= 0) return false;
+  try {
+    // process.kill with signal 0 tests existence (throws on error)
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* ---------------- Single-instance check ---------------- */
+
+async function ensureSingleInstance() {
+  if (!lockExists()) {
+    // no lock -> ok
+    return true;
+  }
+  const pid = readLockPid();
+  if (!pid) {
+    // lock file invalid — remove and continue
+    removeLockFile();
+    return true;
+  }
+  if (!isPidRunning(pid)) {
+    // stale lock -> remove and continue
+    console.log(chalk.yellow(`Found stale lock (pid ${pid}), removing.`));
+    removeLockFile();
+    return true;
+  }
+
+  // running pid exists
+  console.log(chalk.red(`Another bot process is already running (pid ${pid}).`));
+  const { action } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "action",
+      message: "Bạn muốn làm gì?",
+      choices: [
+        { name: "Không làm gì (hủy start)", value: "abort" },
+        { name: "Kill tiến trình cũ rồi start mới (force)", value: "force" }
+      ]
+    }
+  ]);
+  if (action === "abort") return false;
+
+  // kill existing process
+  try {
+    process.kill(pid, "SIGTERM");
+    // wait short time for it to die
+    for (let i = 0; i < 10; i++) {
+      if (!isPidRunning(pid)) break;
+      await new Promise(r => setTimeout(r, 200));
+    }
+    if (isPidRunning(pid)) {
+      // try SIGKILL
+      try { process.kill(pid, "SIGKILL"); } catch {}
+      // wait a bit
+      for (let i = 0; i < 10; i++) {
+        if (!isPidRunning(pid)) break;
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+  } catch (e) {
+    console.log(chalk.yellow(`Không thể kill pid ${pid}: ${String(e)}`));
+  }
+
+  if (isPidRunning(pid)) {
+    console.log(chalk.red(`Không thể dừng tiến trình ${pid}. Hủy.`));
+    return false;
+  }
+
+  // remove lock and continue
+  removeLockFile();
+  return true;
+}
+
+/* --------------- Bot control (light logs) --------------- */
+
+async function startBot() {
+  if (state.running) {
+    console.log(chalk.yellow("Bot đã chạy rồi."));
+    return;
+  }
+
+  const allowed = await ensureSingleInstance();
+  if (!allowed) {
+    console.log(chalk.red("Start aborted."));
+    return;
+  }
+
+  // create lock with current PID (main process)
+  writeLockPid(process.pid);
+
+  // confirm remote ownership if needed
+  if (state.ip !== "127.0.0.1" && state.ip !== "localhost") {
+    const { token } = await inquirer.prompt([{ name: "token", message: "Remote target detected. Gõ YES-I-OWN-THIS để xác nhận:", type: "input" }]);
+    if (token !== "YES-I-OWN-THIS") {
+      console.log(chalk.red("Xác nhận không hợp lệ — hủy."));
+      removeLockFile();
+      return;
+    }
+  }
+
+  // try dynamic import of mineflayer & plugins
+  let mineflayer, pathfinderPlugin, pvpPlugin, armorManagerPlugin, autoEatPlugin;
+  try {
+    mineflayer = (await import("mineflayer")).createBot;
+    pathfinderPlugin = (await import("mineflayer-pathfinder")).pathfinder;
+    pvpPlugin = (await import("mineflayer-pvp")).plugin;
+    armorManagerPlugin = (await import("mineflayer-armor-manager")).plugin;
+    try { autoEatPlugin = (await import("mineflayer-auto-eat")).default || (await import("mineflayer-auto-eat")); } catch(e){ autoEatPlugin = null; }
+  } catch (e) {
+    console.log(chalk.red("Thiếu packages cần thiết."));
+    console.log(chalk.cyan("Hãy chạy:\n npm install mineflayer mineflayer-pathfinder mineflayer-pvp mineflayer-armor-manager mineflayer-auto-eat minecraft-data vec3"));
+    removeLockFile();
+    return;
+  }
+
+  state.spinner = ora({ text: "Khởi tạo bot...", spinner: "dots" }).start();
+
+  try {
+    const bot = mineflayer({
+      host: state.ip,
+      port: Number(state.port),
+      username: state.name,
+      version: state.version === "auto" ? false : state.version
+    });
+
+    bot.loadPlugin(pathfinderPlugin);
+    bot.loadPlugin(pvpPlugin);
+    bot.loadPlugin(armorManagerPlugin);
+    if (autoEatPlugin) bot.loadPlugin(autoEatPlugin);
+
+    const shortLog = (m) => console.log(chalk.blue("►"), m);
+
+    bot.once("spawn", () => {
+      state.spinner.succeed("Bot connected");
+      state.running = true;
+      state.bot = bot;
+      shortLog(`${state.name} joined ${state.ip}:${state.port} (v${state.version})`);
+
+      // features
+      if (state.features.includes("auto_eat") && bot.autoEat) {
+        try { bot.autoEat.options = { priority: "saturation", startAt: 14, bannedFood: [] }; shortLog("Auto-eat on"); } catch {}
+      }
+      if (state.features.includes("auto_totem") && bot.armorManager) {
+        try { bot.armorManager.start(); shortLog("Armor manager started"); } catch {}
+        bot._checkTotemInterval = setInterval(() => {
+          try {
+            const totem = bot.inventory.items().find(i => i && i.name && i.name.includes("totem"));
+            if (totem) bot.equip(totem, "off-hand").catch(()=>{});
+          } catch {}
+        }, 5000);
+      }
+      if (state.features.includes("auto_pvp")) {
+        shortLog("PvP enabled");
+        bot.on("entitySpawn", tryPvp.bind(null, bot));
+        bot.on("entityHurt", tryPvp.bind(null, bot));
+      }
+      if (state.features.includes("auto_mine")) {
+        shortLog("Auto-mine enabled (simple)");
+        bot._autoMineInterval = setInterval(async () => {
+          if (!state.running) return;
+          try {
+            const block = bot.findBlock({ matching: b => b && b.name && (b.name.includes("stone") || b.name.includes("ore")), maxDistance: 10 });
+            if (block) {
+              shortLog(`Dig ${block.name} at ${block.position}`);
+              await bot.dig(block).catch(()=>{});
+              shortLog(`Done dig`);
+            }
+          } catch(e){}
+        }, 15000 + Math.floor(Math.random()*10000));
+      }
+      if (state.features.includes("auto_walk")) {
+        shortLog("Auto-walk enabled");
+        bot._autoWalkInterval = setInterval(() => {
+          try { bot.setControlState("forward", true); setTimeout(()=>bot.setControlState("forward", false), 700 + Math.random()*1200); } catch(e) {}
+        }, 5000);
+      }
+
+    });
+
+    bot.on("kicked", (reason) => { shortLog(`Kicked: ${reason}`); cleanupBot(); });
+    bot.on("end", () => { shortLog("Disconnected"); cleanupBot(); });
+    bot.on("error", (err) => { shortLog(`Error: ${String(err)}`); });
+    bot.on("death", () => { shortLog("Died — respawning..."); });
+
+    async function tryPvp(botRef) {
+      if (!state.features.includes("auto_pvp")) return;
+      try {
+        const targets = Object.values(botRef.entities).filter(e => e && (e.type === "mob" || e.type === "player") && e.id !== botRef.entity.id);
+        if (!targets.length) return;
+        const target = targets.sort((a,b) => botRef.entity.position.distanceTo(a.position) - botRef.entity.position.distanceTo(b.position))[0];
+        if (target && target.position) {
+          shortLog(`Engage ${target.username || target.type}`);
+          const { pathfinder, goals } = botRef;
+          const GoalNear = goals.GoalNear;
+          botRef.pathfinder.setGoal(new GoalNear(target.position.x, target.position.y, target.position.z, 1), true);
+          if (botRef.pvp && botRef.pvp.attack) setTimeout(()=>{ botRef.pvp.attack(target).catch(()=>{}); }, 2500);
+        }
+      } catch(e){}
+    }
+
+    function cleanupBot() {
+      try { if (bot._autoMineInterval) clearInterval(bot._autoMineInterval); } catch {}
+      try { if (bot._autoWalkInterval) clearInterval(bot._autoWalkInterval); } catch {}
+      try { if (bot._checkTotemInterval) clearInterval(bot._checkTotemInterval); } catch {}
+      try { bot.quit(); } catch {}
+      state.bot = null;
+      state.running = false;
+      // remove lock file
+      try { removeLockFile(); } catch {}
+    }
+
+    state.bot = bot;
+
+  } catch (err) {
+    state.spinner.fail("Failed to create bot: " + String(err));
+    removeLockFile();
+    return;
+  }
+}
+
+function stopBot() {
+  if (!state.running || !state.bot) {
+    console.log(chalk.yellow("Bot chưa chạy"));
+    removeLockFile();
+    return;
+  }
+  try {
+    if (state.bot._autoMineInterval) clearInterval(state.bot._autoMineInterval);
+    if (state.bot._autoWalkInterval) clearInterval(state.bot._autoWalkInterval);
+    if (state.bot._checkTotemInterval) clearInterval(state.bot._checkTotemInterval);
+    state.bot.quit("Stopped by user");
+  } catch (e) {}
+  state.bot = null;
+  state.running = false;
+  removeLockFile();
+  console.log(chalk.red("> Bot stopped"));
+}
+
+async function mainMenu() {
+  while (true) {
+    console.clear();
+    drawHeader();
+    drawStatus();
+    const answers = await inquirer.prompt([
+      {
+        type: "list",
+        name: "act",
+        message: "Chọn hành động",
+        choices: [
+          { name: "Nhập IP và Port", value: "set_addr" },
+          { name: "Nhập tên bot", value: "set_name" },
+          { name: "Nhập phiên bản Minecraft", value: "set_version" },
+          { name: "Chọn chế độ (auto-mine, auto-totem...)", value: "set_features" },
+          { name: state.running ? "🟥 Stop" : "🟩 Run", value: state.running ? "stop" : "run" },
+          { name: "Thoát", value: "exit" }
+        ]
+      }
+    ]);
+
+    if (answers.act === "set_addr") {
+      const resp = await inquirer.prompt([
+        { name: "ip", message: "IP server:", default: state.ip },
+        { name: "port", message: "Port:", default: String(state.port), validate: v => /^\d+$/.test(v) || "Port phải là số" }
+      ]);
+      state.ip = resp.ip;
+      state.port = Number(resp.port);
+    } else if (answers.act === "set_name") {
+      const resp = await inquirer.prompt([{ name: "name", message: "Tên bot:", default: state.name }]);
+      state.name = resp.name || state.name;
+    } else if (answers.act === "set_version") {
+      const resp = await inquirer.prompt([{ name: "version", message: "Phiên bản:", default: state.version }]);
+      state.version = resp.version || state.version;
+    } else if (answers.act === "set_features") {
+      const resp = await inquirer.prompt([{ type: "checkbox", name: "features", message: "Chọn tính năng:", choices: featuresChoices, default: state.features }]);
+      state.features = resp.features || [];
+    } else if (answers.act === "run") {
+      await startBot();
+      await new Promise(r => setTimeout(r, 700));
+    } else if (answers.act === "stop") {
+      stopBot();
+      await new Promise(r => setTimeout(r, 400));
+    } else if (answers.act === "exit") {
+      if (state.running && state.bot) stopBot();
+      console.log(chalk.green("Bye 👋"));
+      process.exit(0);
+    }
+  }
+}
+
+/* ----- ensure lock cleanup on exit ----- */
+process.on("SIGINT", () => {
+  try { if (state.running && state.bot) stopBot(); else removeLockFile(); } catch {}
+  console.log(chalk.yellow("\nInterrupted by user."));
+  process.exit(0);
+});
+process.on("exit", () => { try { if (!state.running) removeLockFile(); } catch {} });
+
+mainMenu();
